@@ -11,9 +11,6 @@ and the response is sent back to production.
 
 Webhook integrations are awkward to build locally because **the third-party needs to reach your machine**:
 
-- Your FastAPI server is on `localhost`, behind NAT/firewalls, and often on an unreliable dev network.
-- “Just open a port” is rarely an option (corporate networks, Wi‑Fi, security policies).
-
 Tools like ngrok (and similar tunneling/reverse-proxy setups) can solve this, but for webhook development they can also feel **overly complex**: extra moving parts, extra configuration, and yet another service to pay for.
 
 This project is the alternative I wanted: **a simple, free, open-source relay** specifically for developing webhook handlers. Instead of exposing your laptop to the internet, updating your webhook registration, you run a tiny websocket “relay” websocket in production. Then you connect a local client, receive real webhook requests, replay them against `http://localhost:...`, and send the response back upstream.
@@ -49,10 +46,6 @@ When installed (default `path_prefix` is `/fastapi-dev-proxy`), the relay regist
 - `{path_prefix}/disable` (POST): disable forwarding (requires `?token=...`)
 
 ### Client usage
-
-The client must include the shared token as the `token` query param when connecting (e.g. `...?token=...`). To avoid hardcoding secrets in source control, read it from an environment variable.
-
-### CLI
 
 ```
 export FASTAPI_DEV_PROXY_TOKEN="your-shared-token"
