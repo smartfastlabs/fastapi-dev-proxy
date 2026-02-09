@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import httpx
 import pytest
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.websockets import WebSocketDisconnect
 
 from fastapi_dev_proxy.server import RelayManager, RelayProxyMiddleware
@@ -107,7 +108,7 @@ def test_should_proxy_pattern_matching(
     path: str,
     expected: bool,
 ) -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     relay._override_paths = set(override_paths)
     relay._websocket = object()
     request = _make_request(path)
@@ -135,7 +136,7 @@ async def test_handle_connection_sets_override_paths() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_connection_disabled() -> None:
-    relay = RelayManager(enabled=False)
+    relay = RelayManager(token="secret", enabled=False)
     websocket, state = _make_websocket(messages=[])
 
     await relay.handle_connection(websocket)
@@ -155,9 +156,68 @@ async def test_handle_connection_rejects_bad_token() -> None:
     assert state["close_code"] == 1008
 
 
+def test_install_registers_default_endpoints() -> None:
+    app = FastAPI()
+    relay = RelayManager(token="secret", enabled=True)
+    relay.install(app)
+
+    paths = {getattr(route, "path", None) for route in app.router.routes}
+    assert "/fastapi-dev-proxy/websocket" in paths
+    assert "/fastapi-dev-proxy/enable" in paths
+    assert "/fastapi-dev-proxy/disable" in paths
+
+
+@pytest.mark.asyncio
+async def test_enable_disable_endpoints_require_token_when_configured() -> None:
+    app = FastAPI()
+    relay = RelayManager(token="secret", enabled=False)
+    relay.install(app, path_prefix="/fastapi-dev-proxy")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.post("/fastapi-dev-proxy/enable")
+        assert missing.status_code == 403
+
+        wrong = await client.post("/fastapi-dev-proxy/enable?token=wrong")
+        assert wrong.status_code == 403
+
+        ok = await client.post("/fastapi-dev-proxy/enable?token=secret")
+        assert ok.status_code == 200
+        assert ok.json() == {"enabled": True}
+
+        ok_disable = await client.post("/fastapi-dev-proxy/disable?token=secret")
+        assert ok_disable.status_code == 200
+        assert ok_disable.json() == {"enabled": False}
+
+    assert relay.is_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_disable_closes_active_websocket_and_clears_override_paths() -> None:
+    app = FastAPI()
+    relay = RelayManager(token="secret", enabled=True)
+    relay.install(app, path_prefix="/fastapi-dev-proxy")
+
+    websocket, state = _make_websocket(messages=[])
+    await relay._set_connection(websocket)
+    relay._override_paths = {"/webhook/sms"}
+    assert relay.is_connected() is True
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post("/fastapi-dev-proxy/disable?token=secret")
+        assert res.status_code == 200
+        assert res.json() == {"enabled": False}
+
+    assert relay.is_enabled() is False
+    assert relay.is_connected() is False
+    assert relay.override_paths() == set()
+    assert state["closed"] is True
+
+
 @pytest.mark.asyncio
 async def test_handle_connection_bad_init_message() -> None:
-    relay = RelayManager(token=None, enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     websocket, state = _make_websocket(messages=[{"type": "unknown"}])
 
     await relay.handle_connection(websocket)
@@ -168,7 +228,7 @@ async def test_handle_connection_bad_init_message() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_connection_exception_clears() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     websocket, _ = _make_websocket(messages=[], explode_on_receive=True)
 
     await relay.handle_connection(websocket)
@@ -178,7 +238,7 @@ async def test_handle_connection_exception_clears() -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_request_no_connection() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     request = _make_request("/webhook/sms")
     assert await relay.proxy_request(request) is None
     assert relay.is_enabled() is True
@@ -187,7 +247,7 @@ async def test_proxy_request_no_connection() -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_request_non_override_path() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     websocket, _ = _make_websocket(messages=[])
     await relay._set_connection(websocket)
     relay._override_paths = {"/webhook/sms"}
@@ -199,7 +259,7 @@ async def test_proxy_request_non_override_path() -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_request_disabled() -> None:
-    relay = RelayManager(enabled=False)
+    relay = RelayManager(token="secret", enabled=False)
     websocket, _ = _make_websocket(messages=[])
     await relay._set_connection(websocket)
     relay._override_paths = {"/webhook/sms"}
@@ -210,7 +270,7 @@ async def test_proxy_request_disabled() -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_request_round_trip() -> None:
-    relay = RelayManager(enabled=True, timeout_seconds=1)
+    relay = RelayManager(token="secret", enabled=True, timeout_seconds=1)
     websocket, state = _make_websocket(messages=[])
     await relay._set_connection(websocket)
     relay._override_paths = {"/webhook/sms"}
@@ -243,7 +303,7 @@ async def test_proxy_request_round_trip() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_message_ignores_invalid() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     future: asyncio.Future = asyncio.get_running_loop().create_future()
     relay._pending["ok"] = future
 
@@ -261,7 +321,7 @@ async def test_handle_message_ignores_invalid() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_message_defaults_status_code() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     future: asyncio.Future = asyncio.get_running_loop().create_future()
     relay._pending["req"] = future
 
@@ -275,7 +335,7 @@ async def test_handle_message_defaults_status_code() -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_request_timeout() -> None:
-    relay = RelayManager(enabled=True, timeout_seconds=0)
+    relay = RelayManager(token="secret", enabled=True, timeout_seconds=0)
     websocket, _ = _make_websocket(messages=[])
     await relay._set_connection(websocket)
     relay._override_paths = {"/webhook/sms"}
@@ -288,7 +348,7 @@ async def test_proxy_request_timeout() -> None:
 
 @pytest.mark.asyncio
 async def test_clear_connection_fails_pending() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     websocket, _ = _make_websocket(messages=[])
     await relay._set_connection(websocket)
 
@@ -303,7 +363,7 @@ async def test_clear_connection_fails_pending() -> None:
 
 @pytest.mark.asyncio
 async def test_clear_connection_noop_for_other_socket() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     websocket, _ = _make_websocket(messages=[])
     other, _ = _make_websocket(messages=[])
     await relay._set_connection(websocket)
@@ -315,7 +375,7 @@ async def test_clear_connection_noop_for_other_socket() -> None:
 
 @pytest.mark.asyncio
 async def test_set_connection_replaces_existing() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     first, first_state = _make_websocket(messages=[])
     second, _ = _make_websocket(messages=[])
 
@@ -328,7 +388,7 @@ async def test_set_connection_replaces_existing() -> None:
 
 @pytest.mark.asyncio
 async def test_set_connection_close_failure() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     first, _ = _make_websocket(messages=[], close_raises=RuntimeError("close failed"))
     second, _ = _make_websocket(messages=[])
 
@@ -340,7 +400,7 @@ async def test_set_connection_close_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_middleware_bypasses_non_http() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     called: list[str] = []
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -353,15 +413,15 @@ async def test_middleware_bypasses_non_http() -> None:
     async def send(message: dict[str, Any]) -> None:
         pass
 
-    middleware = RelayProxyMiddleware(app, relay=relay, websocket_path="/fastapi-dev-proxy")
+    middleware = RelayProxyMiddleware(app, relay=relay, path_prefix="/fastapi-dev-proxy")
     scope = {"type": "websocket", "path": "/other"}
     await middleware(scope, receive, send)
     assert called == ["app"]
 
 
 @pytest.mark.asyncio
-async def test_middleware_bypasses_websocket_path() -> None:
-    relay = RelayManager(enabled=True)
+async def test_middleware_bypasses_reserved_paths() -> None:
+    relay = RelayManager(token="secret", enabled=True)
     called: list[str] = []
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -373,17 +433,23 @@ async def test_middleware_bypasses_websocket_path() -> None:
     async def send(message: dict[str, Any]) -> None:
         pass
 
-    middleware = RelayProxyMiddleware(app, relay=relay, websocket_path="/fastapi-dev-proxy")
-    scope = {"type": "http", "path": "/fastapi-dev-proxy", "method": "GET", "asgi": {"spec_version": "2.3"}}
-    scope.setdefault("query_string", b"")
-    scope.setdefault("headers", [])
-    await middleware(scope, receive, send)
-    assert called == ["app"]
+    middleware = RelayProxyMiddleware(app, relay=relay, path_prefix="/fastapi-dev-proxy")
+    for path in (
+        "/fastapi-dev-proxy/websocket",
+        "/fastapi-dev-proxy/enable",
+        "/fastapi-dev-proxy/disable",
+    ):
+        called.clear()
+        scope = {"type": "http", "path": path, "method": "GET", "asgi": {"spec_version": "2.3"}}
+        scope.setdefault("query_string", b"")
+        scope.setdefault("headers", [])
+        await middleware(scope, receive, send)
+        assert called == ["app"]
 
 
 @pytest.mark.asyncio
 async def test_middleware_proxies_when_should_proxy() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
     websocket, _ = _make_websocket(messages=[])
     await relay._set_connection(websocket)
     relay._override_paths = {"/webhook/sms"}
@@ -399,7 +465,7 @@ async def test_middleware_proxies_when_should_proxy() -> None:
     async def send(message: dict[str, Any]) -> None:
         sent_messages.append(message)
 
-    middleware = RelayProxyMiddleware(app, relay=relay, websocket_path="/fastapi-dev-proxy")
+    middleware = RelayProxyMiddleware(app, relay=relay, path_prefix="/fastapi-dev-proxy")
     scope = {"type": "http", "path": "/webhook/sms", "method": "POST", "asgi": {"spec_version": "2.3"}}
     scope.setdefault("query_string", b"")
     scope.setdefault("headers", [])
@@ -425,7 +491,7 @@ async def test_middleware_proxies_when_should_proxy() -> None:
 
 @pytest.mark.asyncio
 async def test_middleware_passes_through_when_not_proxied() -> None:
-    relay = RelayManager(enabled=True)
+    relay = RelayManager(token="secret", enabled=True)
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await send({"type": "http.response.start", "status": 404, "headers": []})
@@ -439,7 +505,7 @@ async def test_middleware_passes_through_when_not_proxied() -> None:
     async def send(message: dict[str, Any]) -> None:
         sent.append(message)
 
-    middleware = RelayProxyMiddleware(app, relay=relay, websocket_path="/fastapi-dev-proxy")
+    middleware = RelayProxyMiddleware(app, relay=relay, path_prefix="/fastapi-dev-proxy")
     scope = {"type": "http", "path": "/webhook/other", "method": "POST", "asgi": {"spec_version": "2.3"}}
     scope.setdefault("query_string", b"")
     scope.setdefault("headers", [])

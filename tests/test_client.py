@@ -7,7 +7,13 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, Mock
 
-from fastapi_dev_proxy.client import _forward_request, _parse_override_paths, run_client
+from fastapi_dev_proxy.client import (
+    _apply_token,
+    _forward_request,
+    _parse_override_paths,
+    _resolve_token,
+    run_client,
+)
 
 
 class FakeWebSocket:
@@ -101,6 +107,47 @@ def test_parse_override_paths() -> None:
     values = ["/a", "/b"]
     csv_values = ["/c,/d", ""]
     assert _parse_override_paths(values, csv_values) == ["/a", "/b", "/c", "/d"]
+
+
+def test_apply_token_no_token_no_change() -> None:
+    assert _apply_token("ws://example.com/relay", None) == "ws://example.com/relay"
+
+
+def test_apply_token_appends_token() -> None:
+    assert (
+        _apply_token("ws://example.com/relay", "secret")
+        == "ws://example.com/relay?token=secret"
+    )
+
+
+def test_apply_token_preserves_other_query_params() -> None:
+    assert (
+        _apply_token("ws://example.com/relay?a=1", "secret")
+        == "ws://example.com/relay?a=1&token=secret"
+    )
+
+
+def test_apply_token_overrides_existing_token() -> None:
+    assert (
+        _apply_token("ws://example.com/relay?token=old&a=1", "new")
+        == "ws://example.com/relay?a=1&token=new"
+    )
+
+
+def test_resolve_token_prefers_cli_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FASTAPI_DEV_PROXY_TOKEN", "env")
+    assert _resolve_token("cli", "FASTAPI_DEV_PROXY_TOKEN") == "cli"
+
+
+def test_resolve_token_uses_env_when_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FASTAPI_DEV_PROXY_TOKEN", "env")
+    assert _resolve_token(None, "FASTAPI_DEV_PROXY_TOKEN") == "env"
+
+
+def test_resolve_token_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FASTAPI_DEV_PROXY_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="Token is required"):
+        _resolve_token(None, "FASTAPI_DEV_PROXY_TOKEN")
 
 
 @pytest.mark.asyncio

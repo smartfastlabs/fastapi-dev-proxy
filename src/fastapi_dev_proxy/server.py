@@ -8,7 +8,7 @@ import logging
 from typing import cast
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, Response, WebSocket, status
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, status
 from fastapi.websockets import WebSocketDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -36,11 +36,19 @@ class RelayProxyMiddleware:
         app: ASGIApp,
         *,
         relay: RelayManager,
-        websocket_path: str = "/fastapi-dev-proxy",
+        path_prefix: str = "/fastapi-dev-proxy",
     ) -> None:
         self._app = app
         self._relay = relay
-        self._websocket_path = normalize_path(websocket_path.rstrip("/") or "/")
+        prefix = normalize_path(path_prefix.rstrip("/") or "/")
+        if prefix == "/":
+            self._reserved_paths = {"/websocket", "/enable", "/disable"}
+        else:
+            self._reserved_paths = {
+                f"{prefix}/websocket",
+                f"{prefix}/enable",
+                f"{prefix}/disable",
+            }
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
@@ -48,7 +56,7 @@ class RelayProxyMiddleware:
             return
 
         path = scope.get("path") or "/"
-        if normalize_path(path) == self._websocket_path:
+        if normalize_path(path) in self._reserved_paths:
             await self._app(scope, receive, send)
             return
 
@@ -67,11 +75,13 @@ class RelayManager:
         self,
         *,
         app: FastAPI | None = None,
-        websocket_path: str = "/fastapi-dev-proxy",
-        token: str | None = None,
+        path_prefix: str = "/fastapi-dev-proxy",
+        token: str,
         enabled: bool = True,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        if not token:
+            raise ValueError("RelayManager token is required (non-empty).")
         self._token = token
         self._enabled = enabled
         self._timeout_seconds = timeout_seconds
@@ -80,7 +90,7 @@ class RelayManager:
         self._pending: dict[str, asyncio.Future[WebhookResponse]] = {}
         self._lock = asyncio.Lock()
         if app is not None:
-            self._install(app, websocket_path=websocket_path)
+            self._install(app, path_prefix=path_prefix)
 
     def is_enabled(self) -> bool:
         return self._enabled
@@ -95,44 +105,81 @@ class RelayManager:
         self,
         app: FastAPI,
         *,
-        websocket_path: str = "/fastapi-dev-proxy",
+        path_prefix: str = "/fastapi-dev-proxy",
     ) -> None:
-        """Register the dev proxy websocket endpoint and HTTP proxy middleware on an existing instance."""
-        self._install(app, websocket_path=websocket_path)
+        """Register the dev proxy endpoints and HTTP proxy middleware on an existing instance.
 
-    @classmethod
-    def for_app(
-        cls,
-        app: FastAPI,
-        *,
-        websocket_path: str = "/fastapi-dev-proxy",
-        token: str | None = None,
-        enabled: bool = True,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-    ) -> RelayManager:
-        """Create a RelayManager and register it on the app (websocket + middleware). Returns the relay."""
-        relay = cls(token=token, enabled=enabled, timeout_seconds=timeout_seconds)
-        relay._install(app, websocket_path=websocket_path)
-        return relay
+        Endpoints:
+
+        - `{path_prefix}/websocket` (websocket) connects the dev client
+        - `{path_prefix}/enable` (HTTP) enables forwarding
+        - `{path_prefix}/disable` (HTTP) disables forwarding
+        """
+        self._install(app, path_prefix=path_prefix)
 
     def _install(
         self,
         app: FastAPI,
         *,
-        websocket_path: str = "/fastapi-dev-proxy",
+        path_prefix: str = "/fastapi-dev-proxy",
     ) -> None:
-        """Register the dev proxy websocket endpoint and HTTP proxy middleware."""
+        """Register the dev proxy endpoints and HTTP proxy middleware."""
+        prefix = normalize_path(path_prefix.rstrip("/") or "/")
+        websocket_path = f"{prefix}/websocket" if prefix != "/" else "/websocket"
+        enable_path = f"{prefix}/enable" if prefix != "/" else "/enable"
+        disable_path = f"{prefix}/disable" if prefix != "/" else "/disable"
+
         self._register_websocket(app, websocket_path)
+        self._register_toggle_routes(app, enable_path=enable_path, disable_path=disable_path)
         app.add_middleware(
             RelayProxyMiddleware,
             relay=self,
-            websocket_path=websocket_path,
+            path_prefix=prefix,
         )
 
     def _register_websocket(self, app: FastAPI, websocket_path: str) -> None:
         @app.websocket(websocket_path)
         async def dev_proxy_ws(ws: WebSocket) -> None:
             await self.handle_connection(ws)
+
+    def _register_toggle_routes(self, app: FastAPI, *, enable_path: str, disable_path: str) -> None:
+        @app.post(enable_path)
+        async def dev_proxy_enable(request: Request) -> dict[str, bool]:
+            if not self._is_token_valid(request.query_params.get("token")):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+            await self.set_enabled(True)
+            return {"enabled": True}
+
+        @app.post(disable_path)
+        async def dev_proxy_disable(request: Request) -> dict[str, bool]:
+            if not self._is_token_valid(request.query_params.get("token")):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+            await self.set_enabled(False)
+            return {"enabled": False}
+
+    def _is_token_valid(self, token: str | None) -> bool:
+        return bool(token) and token == self._token
+
+    async def set_enabled(self, enabled: bool) -> None:
+        """Enable/disable forwarding.
+
+        If disabling while a dev client is connected, closes the websocket and clears override paths.
+        """
+        async with self._lock:
+            self._enabled = enabled
+            if enabled:
+                return
+
+            websocket = self._websocket
+            if websocket is None:
+                self._override_paths = set()
+                return
+
+            try:
+                await websocket.close(code=status.WS_1001_GOING_AWAY)
+            except Exception:
+                logger.debug("Failed to close dev proxy websocket on disable")
+            await self._clear_connection(websocket)
 
 
     async def handle_connection(self, websocket: WebSocket) -> None:
@@ -142,11 +189,9 @@ class RelayManager:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-        if self._token is not None:
-            token = websocket.query_params.get("token")
-            if not token or token != self._token:
-                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                return
+        if not self._is_token_valid(websocket.query_params.get("token")):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
 
         await websocket.accept()
 

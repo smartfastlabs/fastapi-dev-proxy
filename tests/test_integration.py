@@ -216,7 +216,7 @@ async def test_relay_integration_roundtrip_disconnect_reconnect() -> None:
 
     client_task = asyncio.create_task(
         run_client(
-            relay_url=f"ws://127.0.0.1:{prod_port}/fastapi-dev-proxy?token=secret",
+            relay_url=f"ws://127.0.0.1:{prod_port}/fastapi-dev-proxy/websocket?token=secret",
             target_base_url=dev_base_url,
             override_paths=override_paths,
             timeout=2.0,
@@ -389,7 +389,7 @@ async def test_relay_integration_roundtrip_disconnect_reconnect() -> None:
 
         client_task = asyncio.create_task(
             run_client(
-                relay_url=f"ws://127.0.0.1:{prod_port}/fastapi-dev-proxy?token=secret",
+                    relay_url=f"ws://127.0.0.1:{prod_port}/fastapi-dev-proxy/websocket?token=secret",
                 target_base_url=dev_base_url,
                 override_paths=override_paths,
                 timeout=2.0,
