@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.20"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fastapi-dev-proxy"
+version = "0.1.0"
+description = "FastAPI webhook relay/proxy library for local development."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+keywords = ["fastapi", "webhook", "relay", "websocket", "proxy"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+dependencies = [
+  "fastapi>=0.110",
+  "httpx>=0.26",
+  "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest-cov>=5.0",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4.0",
+  "mypy>=1.8",
+  "uvicorn",
+]
+
+[project.urls]
+Homepage = "https://example.com"
+Repository = "https://example.com"
+
+[project.scripts]
+fastapi-dev-proxy = "fastapi_dev_proxy.client:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastapi_dev_proxy"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/fastapi_dev_proxy",
+  "README.md",
+  "LICENSE",
+  "examples",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.envs.default]
+dependencies = [
+  "dobles>=4.0.2",
+  "pytest-cov>=5.0",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4.0",
+  "mypy>=1.8",
+  "uvicorn",
+]
+
+[tool.hatch.envs.default.scripts]
+test = "pytest"
+coverage = "pytest --cov=fastapi_dev_proxy --cov-report=term-missing"
+lint = "ruff check src tests"
+typecheck = "mypy src"
