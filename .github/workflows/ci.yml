@@ -89,9 +89,15 @@ jobs:
           if-no-files-found: error
 
       - name: Upload to Codecov (optional)
-        if: always()
+        # CODECOV_TOKEN is not available to PRs from forks.
+        if: |
+          always() && (
+            github.event_name == 'push' ||
+            (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+          )
         uses: codecov/codecov-action@v5
         with:
           files: coverage.xml
-          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
           verbose: true
