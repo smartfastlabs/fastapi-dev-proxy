@@ -1,5 +1,8 @@
 ## FastAPI Dev Proxy
 
+[![CI](https://github.com/smartfastlabs/fastapi-dev-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/smartfastlabs/fastapi-dev-proxy/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/smartfastlabs/fastapi-dev-proxy/graph/badge.svg)](https://codecov.io/gh/smartfastlabs/fastapi-dev-proxy)
+
 FastAPI webhook relay/proxy library for local development. Production webhooks are
 forwarded over WebSocket to a developer machine, replayed against a local server,
 and the response is sent back to production.
@@ -91,3 +94,15 @@ python -m pytest --cov=fastapi_dev_proxy --cov-report=term-missing
 ruff check src tests
 mypy src
 ```
+
+To generate shareable coverage reports locally:
+
+```
+python -m pytest \
+  --cov=fastapi_dev_proxy \
+  --cov-report=term-missing \
+  --cov-report=xml:coverage.xml \
+  --cov-report=html:htmlcov
+```
+
+CI uploads `coverage.xml` and `htmlcov/` as workflow artifacts. If you enable Codecov for the repo, CI will also upload coverage there (badge above).
