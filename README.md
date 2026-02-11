@@ -17,13 +17,23 @@ This project is the alternative I wanted: **a simple, free, open-source relay** 
 
 A nice side-effect: you can keep the **same third-party webhook URL** (pointing at your production app) and **toggle forwarding on/off** with a config change (e.g. `enabled=False`) or by simply connecting/disconnecting the dev client—no redeploy and no “update webhook URL” dance.
 
+**Single instance vs multiple:** With one FastAPI instance in production, the default setup works with no extra infrastructure. If you run multiple instances behind a load balancer, add `redis_url` and install the `[redis]` extra so webhook requests routed to any instance still reach your dev client.
+
 ### Install
 
 ```
 pip install fastapi-dev-proxy
 ```
 
+**Multiple instances (load balanced):** If you run more than one FastAPI instance in production (e.g. behind a load balancer), install the optional Redis dependency so webhook requests can reach the dev client no matter which instance receives them:
+
+```
+pip install fastapi-dev-proxy[redis]
+```
+
 ### Server integration
+
+**Single instance** (default—no extra infrastructure):
 
 ```python
 from fastapi import FastAPI, Response
@@ -36,6 +46,29 @@ relay = RelayManager(app=app, token="secret", enabled=True, timeout_seconds=25)
 async def sms_webhook() -> Response:
     return Response(status_code=200)
 ```
+
+**Multiple instances** (behind a load balancer): Pass `redis_url` so instances coordinate via Redis. The dev client can connect to any instance; webhook requests to any instance are forwarded correctly:
+
+```python
+import os
+from fastapi import FastAPI, Response
+from fastapi_dev_proxy.server import RelayManager
+
+app = FastAPI()
+relay = RelayManager(
+    app=app,
+    token="secret",
+    enabled=True,
+    timeout_seconds=25,
+    redis_url=os.environ.get("REDIS_URL"),  # e.g. redis://localhost:6379/0
+)
+
+@app.post("/webhook/sms")
+async def sms_webhook() -> Response:
+    return Response(status_code=200)
+```
+
+With `redis_url=None` (the default), behavior is unchanged: single-instance only. Set `redis_url` only when you run multiple instances.
 
 If you prefer, you can create the relay first and call `relay.install(app)` later.
 
