@@ -24,6 +24,8 @@ from .protocol import (
     normalize_path,
     normalize_paths,
 )
+from .redis_constants import HEARTBEAT_INTERVAL_SECONDS, OWNER_KEY_TTL_SECONDS
+from .store import InMemoryRelayStore, RelayStore
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,12 @@ class RelayProxyMiddleware:
 
 
 class RelayManager:
-    """Manage a single dev proxy websocket connection."""
+    """Manage a single dev proxy websocket connection.
+
+    With redis_url set, works across multiple FastAPI instances behind a load balancer:
+    the dev client can connect to any instance and webhook requests to any instance
+    are forwarded to that client. Without redis_url, behavior is single-instance only.
+    """
 
     def __init__(
         self,
@@ -79,6 +86,8 @@ class RelayManager:
         token: str,
         enabled: bool = True,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        redis_url: str | None = None,
+        instance_id: str | None = None,
     ) -> None:
         if not token:
             raise ValueError("RelayManager token is required (non-empty).")
@@ -87,8 +96,31 @@ class RelayManager:
         self._timeout_seconds = timeout_seconds
         self._websocket: WebSocket | None = None
         self._override_paths: set[str] = set()
+        self._override_paths_cache: set[str] = set()
         self._pending: dict[str, asyncio.Future[WebhookResponse]] = {}
         self._lock = asyncio.Lock()
+        self._redis = None
+        self._instance_id: str | None = None
+        self._last_known_owner: str | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._subscribe_task: asyncio.Task[None] | None = None
+
+        if redis_url:
+            try:
+                from .redis_bus import RedisStore, create_redis
+            except ImportError as e:
+                raise ValueError(
+                    "redis_url is set but redis is not installed. "
+                    "Install with: pip install fastapi-dev-proxy[redis]"
+                ) from e
+            self._redis = create_redis(redis_url)
+            self._instance_id = instance_id or uuid4().hex
+            self._store: RelayStore = RedisStore(
+                self._redis, token, self._instance_id, enabled=enabled
+            )
+        else:
+            self._store = InMemoryRelayStore(enabled=enabled)
+
         if app is not None:
             self._install(app, path_prefix=path_prefix)
 
@@ -96,10 +128,16 @@ class RelayManager:
         return self._enabled
 
     def is_connected(self) -> bool:
-        return self._websocket is not None
+        if self._websocket is not None:
+            return True
+        if self._redis is not None and self._last_known_owner is not None:
+            return True
+        return False
 
     def override_paths(self) -> set[str]:
-        return set(self._override_paths)
+        if self._redis is None:
+            return set(self._override_paths)
+        return set(self._override_paths_cache)
 
     def install(
         self,
@@ -167,12 +205,17 @@ class RelayManager:
         """
         async with self._lock:
             self._enabled = enabled
+            await self._store.set_enabled(enabled)
             if enabled:
                 return
 
             websocket = self._websocket
             if websocket is None:
                 self._override_paths = set()
+                self._override_paths_cache = set()
+                await self._store.set_override_paths([])
+                if self._redis is not None:
+                    await self._store.set_owner(None)
                 return
 
             try:
@@ -198,6 +241,12 @@ class RelayManager:
         async with self._lock:
             await self._set_connection(websocket)
 
+        if self._redis is not None:
+            await self._store.set_owner(self._instance_id, ttl_seconds=OWNER_KEY_TTL_SECONDS)
+            self._last_known_owner = self._instance_id
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._subscribe_task = await self._start_redis_subscribe(websocket)
+
         try:
             init_message = cast(RelayInitMessage, await websocket.receive_json())
             if init_message.get("type") != "relay_init":
@@ -205,6 +254,8 @@ class RelayManager:
                 return
             override_paths = normalize_paths(init_message.get("override_paths") or [])
             self._override_paths = set(override_paths)
+            self._override_paths_cache = set(override_paths)
+            await self._store.set_override_paths(override_paths)
             ready_message: RelayReadyMessage = {
                 "type": "relay_ready",
                 "override_paths": override_paths,
@@ -225,13 +276,21 @@ class RelayManager:
     async def proxy_request(self, request: Request) -> Response | None:
         """Proxy a webhook request to the dev proxy if enabled and matched."""
 
-        if not self._should_proxy(request):
+        if not await self._should_proxy(request):
             return None
 
         websocket = self._websocket
-        if websocket is None:
-            return None
+        if websocket is not None:
+            return await self._proxy_request_local(request, websocket)
 
+        if self._redis is not None:
+            return await self._proxy_request_via_redis(request)
+
+        return None
+
+    async def _proxy_request_local(
+        self, request: Request, websocket: WebSocket
+    ) -> Response | None:
         request_id = str(uuid4())
         future: asyncio.Future[WebhookResponse] = (
             asyncio.get_running_loop().create_future()
@@ -269,11 +328,87 @@ class RelayManager:
             headers=relay_response.headers,
         )
 
-    def _should_proxy(self, request: Request) -> bool:
-        if not (self._enabled and self.is_connected()):
+    async def _proxy_request_via_redis(self, request: Request) -> Response | None:
+        from .redis_bus import publish_request, wait_for_response
+
+        request_id = str(uuid4())
+        body = await request.body()
+        payload: WebhookRequestMessage = {
+            "type": "webhook_request",
+            "id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "query": request.url.query,
+            "headers": filter_headers(dict(request.headers)),
+            "body_b64": base64.b64encode(body).decode("ascii"),
+        }
+        await publish_request(self._redis, self._token, payload)
+        relay_response = await wait_for_response(
+            self._redis, self._token, request_id, self._timeout_seconds
+        )
+        if relay_response is None:
+            logger.warning("Dev proxy timed out (id=%s)", request_id)
+            return Response(status_code=status.HTTP_504_GATEWAY_TIMEOUT)
+        return Response(
+            content=relay_response.body,
+            status_code=relay_response.status_code,
+            headers=relay_response.headers,
+        )
+
+    async def _should_proxy(self, request: Request) -> bool:
+        enabled = await self._store.get_enabled()
+        self._enabled = enabled
+        if not enabled:
             return False
+        if self._redis is not None:
+            owner = await self._store.get_owner()
+            self._last_known_owner = owner
+            if owner is None:
+                return False
+            paths = await self._store.get_override_paths()
+            self._override_paths_cache = set(paths)
+        else:
+            if self._websocket is None:
+                return False
+            paths = self._override_paths
         path = normalize_path(request.url.path)
-        return any(match_path(path, pattern) for pattern in self._override_paths)
+        return any(match_path(path, pattern) for pattern in paths)
+
+    async def _heartbeat_loop(self) -> None:
+        if not hasattr(self._store, "renew_owner_ttl"):
+            return
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                await self._store.renew_owner_ttl()
+        except asyncio.CancelledError:
+            pass
+
+    async def _start_redis_subscribe(self, websocket: WebSocket) -> asyncio.Task[None]:
+        from .redis_bus import publish_response, subscribe_requests
+
+        async def on_request(msg: WebhookRequestMessage) -> None:
+            request_id = msg.get("id")
+            if not request_id:
+                return
+            future: asyncio.Future[WebhookResponse] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._pending[request_id] = future
+            try:
+                await websocket.send_json(msg)
+                response = await asyncio.wait_for(
+                    future, timeout=self._timeout_seconds
+                )
+                await publish_response(
+                    self._redis, self._token, response.to_message(request_id)
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Redis request failed id=%s: %s", request_id, exc)
+            finally:
+                self._pending.pop(request_id, None)
+
+        return await subscribe_requests(self._redis, self._token, on_request)
 
     async def _set_connection(self, websocket: WebSocket) -> None:
         if self._websocket is not None and self._websocket is not websocket:
@@ -283,11 +418,30 @@ class RelayManager:
                 logger.debug("Failed to close previous dev proxy connection")
         self._websocket = websocket
         self._override_paths = set()
+        self._override_paths_cache = set()
 
     async def _clear_connection(self, websocket: WebSocket) -> None:
         if self._websocket is websocket:
             self._websocket = None
             self._override_paths = set()
+            self._override_paths_cache = set()
+            if self._redis is not None:
+                await self._store.set_owner(None)
+                self._last_known_owner = None
+                if self._heartbeat_task is not None:
+                    self._heartbeat_task.cancel()
+                    try:
+                        await self._heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._heartbeat_task = None
+                if self._subscribe_task is not None:
+                    self._subscribe_task.cancel()
+                    try:
+                        await self._subscribe_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._subscribe_task = None
         for request_id, future in list(self._pending.items()):
             if not future.done():
                 future.set_exception(RuntimeError("Dev proxy disconnected"))

@@ -103,7 +103,8 @@ def _make_request(path: str, body: bytes = b"payload") -> Request:
         (["/webhook/**"], "/webhook", True),
     ],
 )
-def test_should_proxy_pattern_matching(
+@pytest.mark.asyncio
+async def test_should_proxy_pattern_matching(
     override_paths: list[str],
     path: str,
     expected: bool,
@@ -112,7 +113,7 @@ def test_should_proxy_pattern_matching(
     relay._override_paths = set(override_paths)
     relay._websocket = object()
     request = _make_request(path)
-    assert relay._should_proxy(request) is expected
+    assert (await relay._should_proxy(request)) is expected
 
 
 @pytest.mark.asyncio
